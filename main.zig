@@ -4,6 +4,8 @@ const process = struct {
     const args = @import("args.zig");
 };
 
+pub const std_options: std.Options = .{ .log_level = .info };
+
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{ .verbose_log = true }) = .{};
     defer std.debug.assert(gpa_state.deinit() == .ok);

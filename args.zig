@@ -45,7 +45,7 @@ fn freeSlicePosix(allocator: Allocator, args: []const [:0]const u8) void {
 fn allocSliceWindows(allocator: Allocator) Allocator.Error![][:0]const u8 {
     const command_line_w = mem.span(os.windows.kernel32.GetCommandLineW());
     var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
-    const lengths = Iterator.Windows.getLengths(&command_line_it);
+    const lengths = Iterator.Windows.getLengths(&command_line_it, true);
 
     const args_byte_len = @sizeOf([:0]u8) * lengths.args;
     const raw_len = args_byte_len + lengths.buf;
@@ -60,7 +60,7 @@ fn allocSliceWindows(allocator: Allocator) Allocator.Error![][:0]const u8 {
 
     command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
     var index: usize = 0;
-    while (Iterator.Windows.encodeNext(&command_line_it, buf, index == 0)) |arg| {
+    while (Iterator.Windows.encodeNext(&command_line_it, index == 0, buf)) |arg| {
         args[index] = arg;
         index += 1;
         buf = buf[(arg.len + 1)..];
@@ -124,8 +124,73 @@ fn freeSliceWindowsWasi(allocator: Allocator, args: []const [:0]const u8) void {
     allocator.free(raw);
 }
 
-const Iterator = struct {
-    const Windows = struct {
+/// Initializes an iterator over the current process's command line arguments.
+/// On Windows and WASI, an internal buffer may be allocated.
+/// On other platforms, no memory will be allocated.
+/// Caller must call `Iterator.deinit` to free the iterator's internal buffer when done.
+pub fn iterator(allocator: Allocator) Allocator.Error!Iterator {
+    return Iterator.initFromCurrentProcess(allocator);
+}
+
+pub const Iterator = struct {
+    underlying_iterator: Native,
+
+    pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
+        return .{
+            .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
+                0 => Native.initFromCurrentProcess(),
+                1 => try Native.initFromCurrentProcess(allocator),
+                else => comptime unreachable,
+            },
+        };
+    }
+
+    pub fn next(it: *Iterator) ?[:0]const u8 {
+        return it.underlying_iterator.next();
+    }
+
+    pub fn skip(it: *Iterator) bool {
+        return it.underlying_iterator.skip();
+    }
+
+    pub fn deinit(it: *Iterator) void {
+        if (!@hasDecl(@TypeOf(it.underlying_iterator), "deinit")) return;
+        it.underlying_iterator.deinit();
+    }
+
+    pub const Native = switch (builtin.os.tag) {
+        .windows => Windows,
+        .wasi => if (builtin.link_libc) Posix else Wasi,
+        else => Posix,
+    };
+
+    pub const Posix = struct {
+        args: []const [*:0]const u8,
+        index: usize = 0,
+
+        pub fn init(args: []const [*:0]const u8) Posix {
+            return .{ .args = args };
+        }
+
+        pub fn initFromCurrentProcess() Posix {
+            return Posix.init(os.argv);
+        }
+
+        pub fn next(it: *Posix) ?[:0]const u8 {
+            if (it.index == it.args.len) return null;
+            const arg = mem.span(it.args[it.index]);
+            it.index += 1;
+            return arg;
+        }
+
+        pub fn skip(it: *Posix) bool {
+            if (it.index == it.args.len) return false;
+            it.index += 1;
+            return true;
+        }
+    };
+
+    pub const Windows = struct {
         /// The essential parts of the algorithm are described in Microsoft's documentation:
         ///
         /// - <https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args?view=msvc-170#parsing-c-command-line-arguments>
@@ -138,6 +203,7 @@ const Iterator = struct {
         /// Code points `<= U+0020` terminating an unquoted first argument was discovered
         /// independently by testing and observing the behavior of `CommandLineToArgvW` on
         /// Windows 10.
+        ///
         fn parseCommandLine(context: anytype, first: bool) @TypeOf(context.eof()) {
             var c: u21 = undefined;
 
@@ -146,9 +212,8 @@ const Iterator = struct {
                 c = context.nextCodePoint();
                 switch (c) {
                     0 => {
-                        // Immediately complete the iterator.
-                        // 'CommandLineToArgvW' would return the name of the current
-                        // executable here.
+                        // Immediately complete the iterator without yielding any arguments.
+                        // 'CommandLineToArgvW' would return the name of the current executable.
                         return context.eof();
                     },
                     '"' => {
@@ -200,6 +265,7 @@ const Iterator = struct {
             //   is toggled.
             // - 2n + 1 backslashes followed by a quote emit n backslashes followed by a quote.
             // - n backslashes not followed by a quote emit n backslashes.
+            //
             var backslash_count: usize = 0;
             var inside_quotes = false;
             var after_unquote = false;
@@ -252,7 +318,7 @@ const Iterator = struct {
             }
         }
 
-        fn getLengths(command_line: *unicode.Wtf16LeIterator) struct { args: usize, buf: usize } {
+        fn getLengths(command_line: *unicode.Wtf16LeIterator, first: bool) struct { args: usize, buf: usize } {
             const Counter = struct {
                 command_line: *unicode.Wtf16LeIterator,
                 args: usize = 0,
@@ -276,14 +342,14 @@ const Iterator = struct {
                 }
             };
             var counter: Counter = .{ .command_line = command_line };
-            if (parseCommandLine(&counter, true)) {
+            if (parseCommandLine(&counter, first)) {
                 while (parseCommandLine(&counter, false)) {}
             }
             return .{ .args = counter.args, .buf = counter.buf };
         }
 
-        /// Assumes `buf` is large enough to fit the next argument.
-        fn encodeNext(command_line: *unicode.Wtf16LeIterator, buf: []u8, first: bool) ?[:0]u8 {
+        /// Assumes `buf` is large enough to hold the next argument.
+        fn encodeNext(command_line: *unicode.Wtf16LeIterator, first: bool, buf: []u8) ?[:0]u8 {
             const Encoder = struct {
                 command_line: *unicode.Wtf16LeIterator,
                 buf: []u8,
@@ -310,4 +376,6 @@ const Iterator = struct {
             return parseCommandLine(&encoder, first);
         }
     };
+
+    pub const Wasi = struct {};
 };

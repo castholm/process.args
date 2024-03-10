@@ -11,11 +11,23 @@ pub fn main() !void {
     defer std.debug.assert(gpa_state.deinit() == .ok);
 
     const gpa = gpa_state.allocator();
+    {
+        const args = try process.args.alloc(gpa);
+        defer process.args.free(gpa, args);
 
-    const args = try process.args.alloc(gpa);
-    defer process.args.free(gpa, args);
+        for (args, 0..) |arg, i| {
+            std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+        }
+    }
 
-    for (args, 0..) |arg, i| {
-        std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+    {
+        var args = try process.args.iterator(gpa);
+        defer args.deinit();
+
+        var i: usize = 0;
+        while (args.next()) |arg| {
+            std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+            i += 1;
+        }
     }
 }

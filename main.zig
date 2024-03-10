@@ -15,7 +15,7 @@ pub fn main() !void {
         const args = try process.args.alloc(gpa);
         defer process.args.free(gpa, args);
 
-        for (args, 0..) |arg, i| {
+        for (args[@min(args.len, 1)..], 1..) |arg, i| {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
         }
     }
@@ -24,7 +24,8 @@ pub fn main() !void {
         var args = try process.args.iterator(gpa);
         defer args.deinit();
 
-        var i: usize = 0;
+        _ = args.skip();
+        var i: usize = 1;
         while (args.next()) |arg| {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
             i += 1;

@@ -125,8 +125,8 @@ fn freeSliceWindowsWasi(allocator: Allocator, args: []const [:0]const u8) void {
 }
 
 /// Initializes an iterator over the current process's command line arguments.
-/// On Windows and WASI, an internal buffer may be allocated.
-/// On other platforms, no memory will be allocated.
+/// On Windows and WASI platforms, an internal buffer may be allocated.
+/// On POSIX platforms, no memory will be allocated.
 /// Caller must call `Iterator.deinit` to free the iterator's internal buffer when done.
 pub fn iterator(allocator: Allocator) Allocator.Error!Iterator {
     return Iterator.initFromCurrentProcess(allocator);
@@ -135,7 +135,7 @@ pub fn iterator(allocator: Allocator) Allocator.Error!Iterator {
 pub const Iterator = struct {
     underlying_iterator: Native,
 
-    pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
+    fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
         return .{ .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
             0 => Native.initFromCurrentProcess(),
             1 => try Native.initFromCurrentProcess(allocator),
@@ -189,6 +189,52 @@ pub const Iterator = struct {
     };
 
     pub const Windows = struct {
+        command_line: unicode.Wtf16LeIterator,
+        first: bool = true,
+        buf: []u8,
+        end: usize = 0,
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator, command_line_w: []const u16) Allocator.Error!Windows {
+            var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
+            const lengths = getLengths(&command_line_it, true);
+
+            const buf = try allocator.alloc(u8, lengths.buf);
+
+            return .{
+                .command_line = unicode.Wtf16LeIterator.init(command_line_w),
+                .buf = buf,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Windows {
+            return Windows.init(allocator, mem.span(os.windows.kernel32.GetCommandLineW()));
+        }
+
+        pub fn next(it: *Windows) ?[:0]const u8 {
+            if (encodeNext(&it.command_line, it.first, it.buf[it.end..])) |arg| {
+                it.first = false;
+                it.end += arg.len + 1;
+                return arg;
+            } else {
+                return null;
+            }
+        }
+
+        pub fn skip(it: *Windows) bool {
+            if (skipNext(&it.command_line, it.first)) {
+                it.first = false;
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        pub fn deinit(it: *Windows) void {
+            it.allocator.free(it.buf);
+        }
+
         /// The essential parts of the algorithm are described in Microsoft's documentation:
         ///
         /// - <https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args?view=msvc-170#parsing-c-command-line-arguments>
@@ -372,6 +418,25 @@ pub const Iterator = struct {
             };
             var encoder: Encoder = .{ .command_line = command_line, .buf = buf };
             return parseCommandLine(&encoder, first);
+        }
+
+        fn skipNext(command_line: *unicode.Wtf16LeIterator, first: bool) bool {
+            const Skipper = struct {
+                command_line: *unicode.Wtf16LeIterator,
+                fn nextCodePoint(skipper: *@This()) u21 {
+                    return skipper.command_line.nextCodepoint() orelse 0;
+                }
+                fn emitCodePoint(_: *@This(), _: u21) void {}
+                fn emitBackslashes(_: *@This(), _: usize) void {}
+                fn yield(_: *@This()) bool {
+                    return true;
+                }
+                fn eof(_: *@This()) bool {
+                    return false;
+                }
+            };
+            var skipper: Skipper = .{ .command_line = command_line };
+            return parseCommandLine(&skipper, first);
         }
     };
 

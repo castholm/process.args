@@ -47,14 +47,14 @@ fn allocSliceWindows(allocator: Allocator) Allocator.Error![][:0]const u8 {
     var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
     const lengths = Iterator.Windows.getLengths(&command_line_it, true);
 
-    const args_byte_len = @sizeOf([:0]u8) * lengths.args;
-    const raw_len = args_byte_len + lengths.buf;
+    const args_bytes_len = @sizeOf([:0]u8) * lengths.args;
+    const raw_len = args_bytes_len + lengths.buf;
 
     const raw = try allocator.alignedAlloc(u8, @alignOf([:0]u8), raw_len);
 
-    const args_byte_start = 0;
-    const args = @as([*][:0]u8, @ptrCast(raw.ptr + args_byte_start))[0..lengths.args];
-    const buf_start = args_byte_len;
+    const args_bytes_start = 0;
+    const args = @as([*][:0]u8, @ptrCast(raw.ptr + args_bytes_start))[0..lengths.args];
+    const buf_start = args_bytes_len;
     var buf = raw[buf_start..];
     assert(buf.len == lengths.buf);
 
@@ -136,13 +136,11 @@ pub const Iterator = struct {
     underlying_iterator: Native,
 
     pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
-        return .{
-            .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
-                0 => Native.initFromCurrentProcess(),
-                1 => try Native.initFromCurrentProcess(allocator),
-                else => comptime unreachable,
-            },
-        };
+        return .{ .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
+            0 => Native.initFromCurrentProcess(),
+            1 => try Native.initFromCurrentProcess(allocator),
+            else => comptime unreachable,
+        } };
     }
 
     pub fn next(it: *Iterator) ?[:0]const u8 {
@@ -377,5 +375,74 @@ pub const Iterator = struct {
         }
     };
 
-    pub const Wasi = struct {};
+    pub const Wasi = struct {
+        args: []const [*:0]const u8,
+        index: usize = 0,
+        allocator: ?Allocator = null,
+
+        pub fn init(args: []const [*:0]const u8) Wasi {
+            return .{ .args = args };
+        }
+
+        pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Wasi {
+            return .{
+                .args = allocArgs(allocator) catch |err| switch (err) {
+                    error.Unexpected => &.{},
+                    error.OutOfMemory => return error.OutOfMemory,
+                },
+                .allocator = allocator,
+            };
+        }
+
+        fn allocArgs(allocator: Allocator) (Allocator.Error || os.UnexpectedError)![][*:0]u8 {
+            var args_len: usize = undefined;
+            var buf_len: usize = undefined;
+            switch (os.wasi.args_sizes_get(&args_len, &buf_len)) {
+                .SUCCESS => {},
+                else => |err| return os.unexpectedErrno(err),
+            }
+            if (args_len == 0) return &.{};
+
+            const args_bytes_len = @sizeOf([*:0]u8) * args_len;
+            const raw_len = args_bytes_len + buf_len;
+
+            const raw = try allocator.alignedAlloc(u8, @alignOf([:0]u8), raw_len);
+            errdefer allocator.free(raw);
+
+            const args_bytes_start = 0;
+            const args = @as([*][*:0]u8, @ptrCast(@alignCast(raw.ptr + args_bytes_start)))[0..args_len];
+            const buf_start = args_bytes_len;
+            const buf = raw[buf_start..];
+            assert(buf.len == buf_len);
+
+            return switch (os.wasi.args_get(args.ptr, buf.ptr)) {
+                .SUCCESS => args,
+                else => |err| os.unexpectedErrno(err),
+            };
+        }
+
+        pub fn next(it: *Wasi) ?[:0]const u8 {
+            if (it.index == it.args.len) return null;
+            const arg = mem.span(it.args[it.index]);
+            it.index += 1;
+            return arg;
+        }
+
+        pub fn skip(it: *Wasi) bool {
+            if (it.index == it.args.len) return false;
+            it.index += 1;
+            return true;
+        }
+
+        pub fn deinit(it: *Wasi) void {
+            const allocator = it.allocator orelse return;
+            if (it.args.len == 0) return;
+            var raw_len: usize = @sizeOf([*:0]u8) * it.args.len;
+            for (it.args) |arg| {
+                raw_len += mem.len(arg) + 1;
+            }
+            const raw = @as([*]align(@alignOf([*:0]u8)) const u8, @ptrCast(it.args.ptr))[0..raw_len];
+            allocator.free(raw);
+        }
+    };
 };

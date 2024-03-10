@@ -6,7 +6,7 @@ const Allocator = mem.Allocator;
 const os = std.os;
 const unicode = std.unicode;
 
-/// Allocates a slice containing the current process's command line arguments.
+/// Allocates a slice containing the current process's command-line arguments.
 /// Caller must call `free` when done.
 pub fn alloc(allocator: Allocator) Allocator.Error![][:0]const u8 {
     return (switch (builtin.os.tag) {
@@ -16,7 +16,7 @@ pub fn alloc(allocator: Allocator) Allocator.Error![][:0]const u8 {
     })(allocator);
 }
 
-/// Frees a slice of command line arguments previously allocated with `alloc`.
+/// Frees a slice of command-line arguments previously allocated with `alloc`.
 pub fn free(allocator: Allocator, args: []const [:0]const u8) void {
     (switch (builtin.os.tag) {
         .windows => freeSliceWindowsWasi,
@@ -124,24 +124,20 @@ fn freeSliceWindowsWasi(allocator: Allocator, args: []const [:0]const u8) void {
     allocator.free(raw);
 }
 
-/// Initializes an iterator over the current process's command line arguments.
+/// Initializes an iterator over the current process's command-line arguments.
 /// On Windows and WASI platforms, an internal buffer may be allocated.
 /// On POSIX platforms, no memory will be allocated.
 /// Caller must call `Iterator.deinit` to free the iterator's internal buffer when done.
 pub fn iterator(allocator: Allocator) Allocator.Error!Iterator {
-    return Iterator.initFromCurrentProcess(allocator);
+    return .{ .underlying_iterator = switch (@typeInfo(@TypeOf(Iterator.Native.initFromCurrentProcess)).Fn.params.len) {
+        0 => Iterator.Native.initFromCurrentProcess(),
+        1 => try Iterator.Native.initFromCurrentProcess(allocator),
+        else => comptime unreachable,
+    } };
 }
 
 pub const Iterator = struct {
     underlying_iterator: Native,
-
-    fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
-        return .{ .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
-            0 => Native.initFromCurrentProcess(),
-            1 => try Native.initFromCurrentProcess(allocator),
-            else => comptime unreachable,
-        } };
-    }
 
     pub fn next(it: *Iterator) ?[:0]const u8 {
         return it.underlying_iterator.next();
@@ -197,9 +193,7 @@ pub const Iterator = struct {
 
         pub fn init(allocator: Allocator, command_line_w: []const u16) Allocator.Error!Windows {
             var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
-            const lengths = getLengths(&command_line_it, true);
-
-            const buf = try allocator.alloc(u8, lengths.buf);
+            const buf = try allocator.alloc(u8, getLengths(&command_line_it, true).buf);
 
             return .{
                 .command_line = unicode.Wtf16LeIterator.init(command_line_w),
@@ -253,7 +247,7 @@ pub const Iterator = struct {
 
             // The first argument (the executable name) uses different parsing rules.
             if (first) {
-                c = context.nextCodePoint();
+                c = nextCodePoint(context);
                 switch (c) {
                     0 => {
                         // Immediately complete the iterator without yielding any arguments.
@@ -264,7 +258,7 @@ pub const Iterator = struct {
                         // If the first character is a quote, read everything until the next quote
                         // (then skip that quote), or until the end of the string.
                         while (true) {
-                            c = context.nextCodePoint();
+                            c = nextCodePoint(context);
                             switch (c) {
                                 '"', 0 => return context.yield(),
                                 else => context.emitCodePoint(c),
@@ -278,7 +272,7 @@ pub const Iterator = struct {
                         // characters, the first yielded argument will be the empty string.
                         context.emitCodePoint(c);
                         while (true) {
-                            c = context.nextCodePoint();
+                            c = nextCodePoint(context);
                             switch (c) {
                                 0...' ' => return context.yield(),
                                 else => context.emitCodePoint(c),
@@ -291,7 +285,7 @@ pub const Iterator = struct {
             // Skip spaces and tabs.
             // The iterator completes if we reach the end of the string here.
             while (true) {
-                c = context.nextCodePoint();
+                c = nextCodePoint(context);
                 switch (c) {
                     0 => return context.eof(),
                     ' ', '\t' => continue,
@@ -358,8 +352,12 @@ pub const Iterator = struct {
                         context.emitCodePoint(c);
                     },
                 }
-                c = context.nextCodePoint();
+                c = nextCodePoint(context);
             }
+        }
+
+        fn nextCodePoint(context: anytype) u21 {
+            return context.command_line.nextCodepoint() orelse 0;
         }
 
         fn getLengths(command_line: *unicode.Wtf16LeIterator, first: bool) struct { args: usize, buf: usize } {
@@ -367,9 +365,6 @@ pub const Iterator = struct {
                 command_line: *unicode.Wtf16LeIterator,
                 args: usize = 0,
                 buf: usize = 0,
-                fn nextCodePoint(counter: *@This()) u21 {
-                    return counter.command_line.nextCodepoint() orelse 0;
-                }
                 fn emitCodePoint(counter: *@This(), c: u21) void {
                     counter.buf += unicode.utf8CodepointSequenceLength(c) catch unreachable;
                 }
@@ -398,9 +393,6 @@ pub const Iterator = struct {
                 command_line: *unicode.Wtf16LeIterator,
                 buf: []u8,
                 end: usize = 0,
-                fn nextCodePoint(encoder: *@This()) u21 {
-                    return encoder.command_line.nextCodepoint() orelse 0;
-                }
                 fn emitCodePoint(encoder: *@This(), c: u21) void {
                     encoder.end += unicode.wtf8Encode(c, encoder.buf[encoder.end..]) catch unreachable;
                 }
@@ -423,9 +415,6 @@ pub const Iterator = struct {
         fn skipNext(command_line: *unicode.Wtf16LeIterator, first: bool) bool {
             const Skipper = struct {
                 command_line: *unicode.Wtf16LeIterator,
-                fn nextCodePoint(skipper: *@This()) u21 {
-                    return skipper.command_line.nextCodepoint() orelse 0;
-                }
                 fn emitCodePoint(_: *@This(), _: u21) void {}
                 fn emitBackslashes(_: *@This(), _: usize) void {}
                 fn yield(_: *@This()) bool {
@@ -510,4 +499,265 @@ pub const Iterator = struct {
             allocator.free(raw);
         }
     };
+
+    pub const ResponseFileOptions = struct {
+        comments: bool = false,
+        single_quotes: bool = false,
+    };
+
+    pub fn ResponseFile(comptime options: ResponseFileOptions) type {
+        return struct {
+            response_file: []const u8,
+            index: usize = 0,
+            start_of_line: bool = true,
+            buf: []u8,
+            end: usize = 0,
+            allocator: Allocator,
+
+            pub fn init(allocator: Allocator, response_file: []const u8) Allocator.Error!ResponseFile(options) {
+                var index: usize = 0;
+                var start_of_line: bool = true;
+                const buf = try allocator.alloc(u8, getBufferLength(response_file, &index, &start_of_line));
+
+                return .{
+                    .response_file = response_file,
+                    .buf = buf,
+                    .allocator = allocator,
+                };
+            }
+
+            pub fn next(it: *ResponseFile(options)) ?[:0]const u8 {
+                if (encodeNext(it.response_file, &it.index, &it.start_of_line, it.buf[it.end..])) |arg| {
+                    it.end += arg.len + 1;
+                    return arg;
+                } else {
+                    return null;
+                }
+            }
+
+            pub fn skip(it: *ResponseFile(options)) bool {
+                return skipNext(it.response_file, &it.index, &it.start_of_line);
+            }
+
+            pub fn deinit(it: *ResponseFile(options)) void {
+                it.allocator.free(it.buf);
+            }
+
+            fn parseResponseFile(context: anytype) @TypeOf(context.eof()) {
+                var c: u8 = undefined;
+
+                // Skip whitespace and comments.
+                // If comments are enabled, '#' starts a line comment if it is the first
+                // non-whitespace character on its line, otherwise, it is handled as any
+                // other character.
+                // The iterator completes if we reach the end of the string here.
+                while (true) {
+                    c = nextByte(context);
+                    switch (c) {
+                        0 => {
+                            return context.eof();
+                        },
+                        ' ', '\t' => {
+                            continue;
+                        },
+                        '\r', '\n' => {
+                            context.start_of_line.* = true;
+                            continue;
+                        },
+                        '#' => {
+                            if (options.comments and context.start_of_line.*) {
+                                while (true) {
+                                    c = nextByte(context);
+                                    switch (c) {
+                                        0 => return context.eof(),
+                                        '\n' => break,
+                                        else => continue,
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        },
+                        else => {
+                            break;
+                        },
+                    }
+                }
+                context.start_of_line.* = false;
+
+                // Parsing rules:
+                //
+                // - The end of the string always terminates the current argument.
+                // - When not in 'inside_quotes' mode, a space or tab terminates the
+                //   current argument.
+                // - 2n backslashes followed by a quote emit n backslashes. If in 'inside_quotes'
+                //   and the quote is immediately followed by a second quote, one quote is emitted
+                //   and the other is skipped, otherwise, the one quote is skipped. Finally,
+                //   'inside_quotes' is toggled.
+                // - 2n + 1 backslashes followed by a quote emit n backslashes followed by a quote.
+                // - n backslashes not followed by a quote emit n backslashes.
+                // - The opening quote character must match the closing quote character.
+                //
+                var backslash_count: usize = 0;
+                var inside_quotes = false;
+                var quote_c: u8 = '"';
+                var after_unquote = false;
+                while (true) {
+                    switch (c) {
+                        0 => {
+                            context.emitBackslashes(backslash_count);
+                            return context.yield();
+                        },
+                        ' ', '\t', '\r', '\n' => {
+                            context.emitBackslashes(backslash_count);
+                            backslash_count = 0;
+                            after_unquote = false;
+                            if (inside_quotes) {
+                                context.emitByte(c);
+                            } else {
+                                if (c == '\r' or c == '\n') {
+                                    context.start_of_line.* = true;
+                                }
+                                return context.yield();
+                            }
+                        },
+                        '"', '\'' => {
+                            if (!options.single_quotes and c == '\'' or inside_quotes and c != quote_c) {
+                                context.emitBackslashes(backslash_count);
+                                backslash_count = 0;
+                                after_unquote = false;
+                                context.emitByte(c);
+                            } else {
+                                if (after_unquote) {
+                                    after_unquote = false;
+                                    context.emitByte(c);
+                                } else {
+                                    const c_is_escaped_quote = backslash_count % 2 != 0;
+                                    context.emitBackslashes(backslash_count / 2);
+                                    backslash_count = 0;
+                                    if (c_is_escaped_quote) {
+                                        context.emitByte(c);
+                                    } else {
+                                        if (inside_quotes) {
+                                            after_unquote = true;
+                                        } else {
+                                            quote_c = c;
+                                        }
+                                        inside_quotes = !inside_quotes;
+                                    }
+                                }
+                            }
+                        },
+                        '\\' => {
+                            backslash_count += 1;
+                            after_unquote = false;
+                        },
+                        else => {
+                            context.emitBackslashes(backslash_count);
+                            backslash_count = 0;
+                            after_unquote = false;
+                            context.emitByte(c);
+                        },
+                    }
+                    c = nextByte(context);
+                }
+            }
+
+            fn nextByte(context: anytype) u8 {
+                if (context.index.* != context.response_file.len) {
+                    const c = context.response_file[context.index.*];
+                    context.index.* += 1;
+                    return c;
+                } else {
+                    return 0;
+                }
+            }
+
+            fn getBufferLength(response_file: []const u8, index: *usize, start_of_line: *bool) usize {
+                const Counter = struct {
+                    response_file: []const u8,
+                    index: *usize,
+                    start_of_line: *bool,
+                    buf: usize = 0,
+                    fn emitByte(counter: *@This(), _: u8) void {
+                        counter.buf += 1;
+                    }
+                    fn emitBackslashes(counter: *@This(), n: usize) void {
+                        counter.buf += n;
+                    }
+                    fn yield(counter: *@This()) bool {
+                        counter.buf += 1;
+                        return true;
+                    }
+                    fn eof(_: *@This()) bool {
+                        return false;
+                    }
+                };
+                var counter: Counter = .{
+                    .response_file = response_file,
+                    .index = index,
+                    .start_of_line = start_of_line,
+                };
+                while (parseResponseFile(&counter)) {}
+                return counter.buf;
+            }
+
+            /// Assumes `buf` is large enough to hold the next argument.
+            fn encodeNext(response_file: []const u8, index: *usize, start_of_line: *bool, buf: []u8) ?[:0]u8 {
+                const Encoder = struct {
+                    response_file: []const u8,
+                    index: *usize,
+                    start_of_line: *bool,
+                    buf: []u8,
+                    end: usize = 0,
+                    fn emitByte(encoder: *@This(), c: u8) void {
+                        encoder.buf[encoder.end] = c;
+                        encoder.end += 1;
+                    }
+                    fn emitBackslashes(encoder: *@This(), n: usize) void {
+                        @memset(encoder.buf[encoder.end..][0..n], '\\');
+                        encoder.end += n;
+                    }
+                    fn yield(encoder: *@This()) [:0]u8 {
+                        encoder.buf[encoder.end] = 0;
+                        return encoder.buf[0..encoder.end :0];
+                    }
+                    fn eof(_: *@This()) ?[:0]u8 {
+                        return null;
+                    }
+                };
+                var encoder: Encoder = .{
+                    .response_file = response_file,
+                    .index = index,
+                    .start_of_line = start_of_line,
+                    .buf = buf,
+                };
+                const arg = parseResponseFile(&encoder);
+                return arg;
+            }
+
+            fn skipNext(response_file: []const u8, index: *usize, start_of_line: *bool) bool {
+                const Skipper = struct {
+                    response_file: []const u8,
+                    index: *usize,
+                    start_of_line: *bool,
+                    fn emitByte(_: *@This(), _: u8) void {}
+                    fn emitBackslashes(_: *@This(), _: usize) void {}
+                    fn yield(_: *@This()) bool {
+                        return true;
+                    }
+                    fn eof(_: *@This()) bool {
+                        return false;
+                    }
+                };
+                var skipper: Skipper = .{
+                    .response_file = response_file,
+                    .index = index,
+                    .start_of_line = start_of_line,
+                };
+                const eof = parseResponseFile(&skipper);
+                return eof;
+            }
+        };
+    }
 };

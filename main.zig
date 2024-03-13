@@ -17,15 +17,15 @@ pub fn main() !void {
         std.debug.print("{}\n", .{std.unicode.fmtUtf16Le(std.mem.span(std.os.windows.kernel32.GetCommandLineW()))});
     }
 
-    //std.debug.print("process.args.alloc\n", .{});
-    //{
-    //    const args = try process.args.alloc(gpa);
-    //    defer process.args.free(gpa, args);
+    std.debug.print("process.args.alloc\n", .{});
+    {
+        const args = try process.args.slice(gpa);
+        defer process.args.freeSlice(gpa, args);
 
-    //    for (args[@min(args.len, 1)..], 1..) |arg, i| {
-    //        std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
-    //    }
-    //}
+        for (args, 0..) |arg, i| {
+            std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+        }
+    }
 
     std.debug.print("process.args.iterator\n", .{});
     {

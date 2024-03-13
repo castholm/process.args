@@ -6,138 +6,24 @@ const Allocator = mem.Allocator;
 const os = std.os;
 const unicode = std.unicode;
 
-/// Allocates a slice containing the current process's command-line arguments.
-/// Caller must call `free` when done.
-pub fn alloc(allocator: Allocator) Allocator.Error![][:0]const u8 {
-    return (switch (builtin.os.tag) {
-        .windows => allocSliceWindows,
-        .wasi => if (builtin.link_libc) allocSlicePosix else allocSliceWasi,
-        else => allocSlicePosix,
-    })(allocator);
-}
-
-/// Frees a slice of command-line arguments previously allocated with `alloc`.
-pub fn free(allocator: Allocator, args: []const [:0]const u8) void {
-    (switch (builtin.os.tag) {
-        .windows => freeSliceWindowsWasi,
-        .wasi => if (builtin.link_libc) freeSlicePosix else freeSliceWindowsWasi,
-        else => freeSlicePosix,
-    })(allocator, args);
-}
-
-/// Only the outermost slice is dynamically allocated.
-fn allocSlicePosix(allocator: Allocator) Allocator.Error![][:0]const u8 {
-    if (os.argv.len == 0) return &.{};
-    const args = try allocator.alloc([:0]const u8, os.argv.len);
-    for (args, os.argv) |*dst, src| {
-        dst.* = mem.span(src);
-    }
-    return args;
-}
-
-/// Only the outermost slice is dynamically allocated.
-fn freeSlicePosix(allocator: Allocator, args: []const [:0]const u8) void {
-    if (args.len == 0) return;
-    allocator.free(args);
-}
-
-/// Memory layout: `args.*, args[0].*, args[1].*, ..., args[args.len - 1].*`
-fn allocSliceWindows(allocator: Allocator) Allocator.Error![][:0]const u8 {
-    const command_line_w = mem.span(os.windows.kernel32.GetCommandLineW());
-    var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
-    const lengths = Iterator.Windows.getLengths(&command_line_it, true);
-
-    const args_bytes_len = @sizeOf([:0]u8) * lengths.args;
-    const raw_len = args_bytes_len + lengths.buf;
-
-    const raw = try allocator.alignedAlloc(u8, @alignOf([:0]u8), raw_len);
-
-    const args_bytes_start = 0;
-    const args = @as([*][:0]u8, @ptrCast(raw.ptr + args_bytes_start))[0..lengths.args];
-    const buf_start = args_bytes_len;
-    var buf = raw[buf_start..];
-    assert(buf.len == lengths.buf);
-
-    command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
-    var index: usize = 0;
-    while (Iterator.Windows.encodeNext(&command_line_it, index == 0, buf)) |arg| {
-        args[index] = arg;
-        index += 1;
-        buf = buf[(arg.len + 1)..];
-    }
-    assert(index == args.len);
-    assert(buf.len == 0);
-    return args;
-}
-
-/// Memory layout: `args.*, args[0].*, args[1].*, ..., args[args.len - 1].*`
-fn allocSliceWasi(allocator: Allocator) Allocator.Error![][:0]u8 {
-    return allocSliceWasiInner(allocator) catch |err| switch (err) {
-        error.Unexpected => &.{},
-        error.OutOfMemory => error.OutOfMemory,
-    };
-}
-
-fn allocSliceWasiInner(allocator: Allocator) (Allocator.Error || os.UnexpectedError)![][:0]u8 {
-    var args_len: usize = undefined;
-    var buf_len: usize = undefined;
-    switch (os.wasi.args_sizes_get(&args_len, &buf_len)) {
-        .SUCCESS => {},
-        else => |err| return os.unexpectedErrno(err),
-    }
-    if (args_len == 0) return &.{};
-
-    comptime assert(@sizeOf([:0]u8) >= @sizeOf([*:0]u8));
-    const args_slice_bytes_len = @sizeOf([:0]u8) * args_len;
-    const args_many_bytes_len = @sizeOf([*:0]u8) * args_len;
-    const raw_len = args_slice_bytes_len + buf_len;
-
-    const raw = try allocator.alignedAlloc(u8, @alignOf([:0]u8), raw_len);
-    errdefer allocator.free(raw);
-
-    const args_slice_bytes_start = 0;
-    const args_slice = @as([*][:0]u8, @ptrCast(@alignCast(raw.ptr + args_slice_bytes_start)))[0..args_len];
-    const args_many_bytes_start = args_slice_bytes_len - args_many_bytes_len;
-    const args_many = @as([*][*:0]u8, @ptrCast(@alignCast(raw.ptr + args_many_bytes_start)))[0..args_len];
-    const buf_start = args_slice_bytes_len;
-    const buf = raw[buf_start..];
-    assert(buf.len == buf_len);
-
-    switch (os.wasi.args_get(args_many.ptr, buf.ptr)) {
-        .SUCCESS => {},
-        else => |err| return os.unexpectedErrno(err),
-    }
-    for (args_slice, args_many) |*dst, src| {
-        dst.* = mem.span(src);
-    }
-    return args_slice;
-}
-
-/// Memory layout: `args.*, args[0].*, args[1].*, ..., args[args.len - 1].*`
-fn freeSliceWindowsWasi(allocator: Allocator, args: []const [:0]const u8) void {
-    if (args.len == 0) return;
-    var raw_len: usize = @sizeOf([:0]u8) * args.len;
-    for (args) |arg| {
-        raw_len += arg.len + 1;
-    }
-    const raw = @as([*]align(@alignOf([:0]u8)) const u8, @ptrCast(args.ptr))[0..raw_len];
-    allocator.free(raw);
-}
-
 /// Initializes an iterator over the current process's command-line arguments.
-/// On Windows and WASI platforms, an internal buffer may be allocated.
-/// On POSIX platforms, no memory will be allocated.
 /// Caller must call `Iterator.deinit` to free the iterator's internal buffer when done.
 pub fn iterator(allocator: Allocator) Allocator.Error!Iterator {
-    return .{ .underlying_iterator = switch (@typeInfo(@TypeOf(Iterator.Native.initFromCurrentProcess)).Fn.params.len) {
-        0 => Iterator.Native.initFromCurrentProcess(),
-        1 => try Iterator.Native.initFromCurrentProcess(allocator),
-        else => comptime unreachable,
-    } };
+    return Iterator.initFromCurrentProcess(allocator);
 }
 
 pub const Iterator = struct {
     underlying_iterator: Native,
+
+    pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Iterator {
+        return .{
+            .underlying_iterator = switch (@typeInfo(@TypeOf(Native.initFromCurrentProcess)).Fn.params.len) {
+                0 => Native.initFromCurrentProcess(),
+                1 => try Native.initFromCurrentProcess(allocator),
+                else => comptime unreachable,
+            },
+        };
+    }
 
     pub fn next(it: *Iterator) ?[:0]const u8 {
         return it.underlying_iterator.next();
@@ -147,27 +33,33 @@ pub const Iterator = struct {
         return it.underlying_iterator.skip();
     }
 
-    pub fn deinit(it: *Iterator) void {
-        if (!@hasDecl(@TypeOf(it.underlying_iterator), "deinit")) return;
-        it.underlying_iterator.deinit();
+    pub fn reset(it: *Iterator) void {
+        return it.underlying_iterator.reset();
     }
 
-    pub const Native = switch (builtin.os.tag) {
-        .windows => Windows,
-        .wasi => if (builtin.link_libc) Posix else Wasi,
-        else => Posix,
-    };
+    pub fn deinit(it: *Iterator) void {
+        if (@hasDecl(Native, "deinit")) {
+            it.underlying_iterator.deinit();
+        }
+    }
+
+    pub const Native = if (builtin.os.tag == .windows)
+        Windows
+    else if (builtin.os.tag == .wasi and !builtin.link_libc)
+        Wasi
+    else
+        Posix;
 
     pub const Posix = struct {
         args: []const [*:0]const u8,
         index: usize = 0,
 
-        pub fn init(args: []const [*:0]const u8) Posix {
-            return .{ .args = args };
+        pub fn initFromCurrentProcess() Posix {
+            return init(os.argv);
         }
 
-        pub fn initFromCurrentProcess() Posix {
-            return Posix.init(os.argv);
+        pub fn init(args: []const [*:0]const u8) Posix {
+            return .{ .args = args };
         }
 
         pub fn next(it: *Posix) ?[:0]const u8 {
@@ -182,33 +74,59 @@ pub const Iterator = struct {
             it.index += 1;
             return true;
         }
+
+        pub fn reset(it: *Posix) void {
+            it.index = 0;
+        }
     };
 
     pub const Windows = struct {
         command_line: unicode.Wtf16LeIterator,
-        first: bool = true,
         buf: []u8,
         end: usize = 0,
         allocator: Allocator,
 
-        pub fn init(allocator: Allocator, command_line_w: []const u16) Allocator.Error!Windows {
-            var command_line_it = unicode.Wtf16LeIterator.init(command_line_w);
-            const buf = try allocator.alloc(u8, getLengths(&command_line_it, true).buf);
+        pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Windows {
+            return init(allocator, os.windows.kernel32.GetCommandLineW());
+        }
+
+        pub fn init(allocator: Allocator, command_line_w: [*:0]const u16) Allocator.Error!Windows {
+            const command_line_w_slice = mem.span(command_line_w);
+            var command_line_it = unicode.Wtf16LeIterator.init(command_line_w_slice);
+            const buf = try allocator.alloc(u8, countLengths(&command_line_it).buf);
 
             return .{
-                .command_line = unicode.Wtf16LeIterator.init(command_line_w),
+                .command_line = unicode.Wtf16LeIterator.init(command_line_w_slice),
                 .buf = buf,
                 .allocator = allocator,
             };
         }
 
-        pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Windows {
-            return Windows.init(allocator, mem.span(os.windows.kernel32.GetCommandLineW()));
-        }
-
         pub fn next(it: *Windows) ?[:0]const u8 {
-            if (encodeNext(&it.command_line, it.first, it.buf[it.end..])) |arg| {
-                it.first = false;
+            const Encoder = struct {
+                command_line: *unicode.Wtf16LeIterator,
+                buf: []u8,
+                end: usize = 0,
+                fn readNextCharacter(encoder: *@This()) u21 {
+                    return encoder.command_line.nextCodepoint() orelse 0;
+                }
+                fn writeCharacter(encoder: *@This(), c: u21) void {
+                    encoder.end += unicode.wtf8Encode(c, encoder.buf[encoder.end..]) catch unreachable;
+                }
+                fn writeBackslashes(encoder: *@This(), n: usize) void {
+                    @memset(encoder.buf[encoder.end..][0..n], '\\');
+                    encoder.end += n;
+                }
+                fn yield(encoder: *@This()) [:0]u8 {
+                    encoder.buf[encoder.end] = 0;
+                    return encoder.buf[0..encoder.end :0];
+                }
+                fn eof(_: *@This()) ?[:0]u8 {
+                    return null;
+                }
+            };
+            var encoder: Encoder = .{ .command_line = &it.command_line, .buf = it.buf[it.end..] };
+            if (parseCommandLineString(&encoder, .windows, it.command_line.i == 0)) |arg| {
                 it.end += arg.len + 1;
                 return arg;
             } else {
@@ -217,158 +135,44 @@ pub const Iterator = struct {
         }
 
         pub fn skip(it: *Windows) bool {
-            if (skipNext(&it.command_line, it.first)) {
-                it.first = false;
-                return true;
-            } else {
-                return false;
-            }
+            const Skipper = struct {
+                command_line: *unicode.Wtf16LeIterator,
+                fn readNextCharacter(skipper: *@This()) u21 {
+                    return skipper.command_line.nextCodepoint() orelse 0;
+                }
+                fn writeCharacter(_: *@This(), _: u21) void {}
+                fn writeBackslashes(_: *@This(), _: usize) void {}
+                fn yield(_: *@This()) bool {
+                    return true;
+                }
+                fn eof(_: *@This()) bool {
+                    return false;
+                }
+            };
+            var skipper: Skipper = .{ .command_line = &it.command_line };
+            return parseCommandLineString(&skipper, .windows, it.command_line.i == 0);
+        }
+
+        pub fn reset(it: *Windows) void {
+            it.command_line.i = 0;
         }
 
         pub fn deinit(it: *Windows) void {
             it.allocator.free(it.buf);
         }
 
-        /// The essential parts of the algorithm are described in Microsoft's documentation:
-        ///
-        /// - <https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args?view=msvc-170#parsing-c-command-line-arguments>
-        /// - <https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw>
-        ///
-        /// David Deley explains some additional undocumented quirks in great detail:
-        ///
-        /// - <https://daviddeley.com/autohotkey/parameters/parameters.htm#WINCRULES>
-        ///
-        /// Code points `<= U+0020` terminating an unquoted first argument was discovered
-        /// independently by testing and observing the behavior of `CommandLineToArgvW` on
-        /// Windows 10.
-        ///
-        fn parseCommandLine(context: anytype, first: bool) @TypeOf(context.eof()) {
-            var c: u21 = undefined;
-
-            // The first argument (the executable name) uses different parsing rules.
-            if (first) {
-                c = nextCodePoint(context);
-                switch (c) {
-                    0 => {
-                        // Immediately complete the iterator without yielding any arguments.
-                        // 'CommandLineToArgvW' would return the name of the current executable.
-                        return context.eof();
-                    },
-                    '"' => {
-                        // If the first character is a quote, read everything until the next quote
-                        // (then skip that quote), or until the end of the string.
-                        while (true) {
-                            c = nextCodePoint(context);
-                            switch (c) {
-                                '"', 0 => return context.yield(),
-                                else => context.emitCodePoint(c),
-                            }
-                        }
-                    },
-                    else => {
-                        // Otherwise, read everything until the next space or non-DEL ASCII control
-                        // character (then skip that character), or until the end of the string.
-                        // This means that if the command-line string starts with one of these
-                        // characters, the first yielded argument will be the empty string.
-                        context.emitCodePoint(c);
-                        while (true) {
-                            c = nextCodePoint(context);
-                            switch (c) {
-                                0...' ' => return context.yield(),
-                                else => context.emitCodePoint(c),
-                            }
-                        }
-                    },
-                }
-            }
-
-            // Skip spaces and tabs.
-            // The iterator completes if we reach the end of the string here.
-            while (true) {
-                c = nextCodePoint(context);
-                switch (c) {
-                    0 => return context.eof(),
-                    ' ', '\t' => continue,
-                    else => break,
-                }
-            }
-
-            // Parsing rules for subsequent arguments:
-            //
-            // - The end of the string always terminates the current argument.
-            // - When not in 'inside_quotes' mode, a space or tab terminates the current argument.
-            // - 2n backslashes followed by a quote emit n backslashes. If in 'inside_quotes' and
-            //   the quote is immediately followed by a second quote, one quote is emitted and the
-            //   other is skipped, otherwise, the one quote is skipped. Finally, 'inside_quotes'
-            //   is toggled.
-            // - 2n + 1 backslashes followed by a quote emit n backslashes followed by a quote.
-            // - n backslashes not followed by a quote emit n backslashes.
-            //
-            var backslash_count: usize = 0;
-            var inside_quotes = false;
-            var after_unquote = false;
-            while (true) {
-                switch (c) {
-                    0 => {
-                        context.emitBackslashes(backslash_count);
-                        return context.yield();
-                    },
-                    ' ', '\t' => {
-                        context.emitBackslashes(backslash_count);
-                        backslash_count = 0;
-                        after_unquote = false;
-                        if (inside_quotes) {
-                            context.emitCodePoint(c);
-                        } else {
-                            return context.yield();
-                        }
-                    },
-                    '"' => {
-                        if (after_unquote) {
-                            after_unquote = false;
-                            context.emitCodePoint('"');
-                        } else {
-                            const c_is_escaped_quote = backslash_count % 2 != 0;
-                            context.emitBackslashes(backslash_count / 2);
-                            backslash_count = 0;
-                            if (c_is_escaped_quote) {
-                                context.emitCodePoint('"');
-                            } else {
-                                if (inside_quotes) {
-                                    after_unquote = true;
-                                }
-                                inside_quotes = !inside_quotes;
-                            }
-                        }
-                    },
-                    '\\' => {
-                        backslash_count += 1;
-                        after_unquote = false;
-                    },
-                    else => {
-                        context.emitBackslashes(backslash_count);
-                        backslash_count = 0;
-                        after_unquote = false;
-                        context.emitCodePoint(c);
-                    },
-                }
-                c = nextCodePoint(context);
-            }
-        }
-
-        fn nextCodePoint(context: anytype) u21 {
-            return context.command_line.nextCodepoint() orelse 0;
-        }
-
-        fn getLengths(command_line: *unicode.Wtf16LeIterator, first: bool) struct { args: usize, buf: usize } {
+        fn countLengths(command_line: *unicode.Wtf16LeIterator) struct { args: usize, buf: usize } {
             const Counter = struct {
                 command_line: *unicode.Wtf16LeIterator,
                 args: usize = 0,
                 buf: usize = 0,
-                fn emitCodePoint(counter: *@This(), c: u21) void {
+                fn readNextCharacter(counter: *@This()) u21 {
+                    return counter.command_line.nextCodepoint() orelse 0;
+                }
+                fn writeCharacter(counter: *@This(), c: u21) void {
                     counter.buf += unicode.utf8CodepointSequenceLength(c) catch unreachable;
                 }
-                fn emitBackslashes(counter: *@This(), n: usize) void {
+                fn writeBackslashes(counter: *@This(), n: usize) void {
                     counter.buf += n;
                 }
                 fn yield(counter: *@This()) bool {
@@ -381,98 +185,69 @@ pub const Iterator = struct {
                 }
             };
             var counter: Counter = .{ .command_line = command_line };
-            if (parseCommandLine(&counter, first)) {
-                while (parseCommandLine(&counter, false)) {}
-            }
+            while (parseCommandLineString(&counter, .windows, command_line.i == 0)) {}
             return .{ .args = counter.args, .buf = counter.buf };
-        }
-
-        /// Assumes `buf` is large enough to hold the next argument.
-        fn encodeNext(command_line: *unicode.Wtf16LeIterator, first: bool, buf: []u8) ?[:0]u8 {
-            const Encoder = struct {
-                command_line: *unicode.Wtf16LeIterator,
-                buf: []u8,
-                end: usize = 0,
-                fn emitCodePoint(encoder: *@This(), c: u21) void {
-                    encoder.end += unicode.wtf8Encode(c, encoder.buf[encoder.end..]) catch unreachable;
-                }
-                fn emitBackslashes(encoder: *@This(), n: usize) void {
-                    @memset(encoder.buf[encoder.end..][0..n], '\\');
-                    encoder.end += n;
-                }
-                fn yield(encoder: *@This()) [:0]u8 {
-                    encoder.buf[encoder.end] = 0;
-                    return encoder.buf[0..encoder.end :0];
-                }
-                fn eof(_: *@This()) ?[:0]u8 {
-                    return null;
-                }
-            };
-            var encoder: Encoder = .{ .command_line = command_line, .buf = buf };
-            return parseCommandLine(&encoder, first);
-        }
-
-        fn skipNext(command_line: *unicode.Wtf16LeIterator, first: bool) bool {
-            const Skipper = struct {
-                command_line: *unicode.Wtf16LeIterator,
-                fn emitCodePoint(_: *@This(), _: u21) void {}
-                fn emitBackslashes(_: *@This(), _: usize) void {}
-                fn yield(_: *@This()) bool {
-                    return true;
-                }
-                fn eof(_: *@This()) bool {
-                    return false;
-                }
-            };
-            var skipper: Skipper = .{ .command_line = command_line };
-            return parseCommandLine(&skipper, first);
         }
     };
 
     pub const Wasi = struct {
-        args: []const [*:0]const u8,
+        args: [][*:0]u8,
         index: usize = 0,
-        allocator: ?Allocator = null,
-
-        pub fn init(args: []const [*:0]const u8) Wasi {
-            return .{ .args = args };
-        }
+        allocator: Allocator,
 
         pub fn initFromCurrentProcess(allocator: Allocator) Allocator.Error!Wasi {
+            return init(allocator, os.wasi.args_sizes_get, os.wasi.args_get);
+        }
+
+        pub fn init(
+            allocator: Allocator,
+            comptime args_sizes_get: @TypeOf(os.wasi.args_sizes_get),
+            comptime args_get: @TypeOf(os.wasi.args_get),
+        ) Allocator.Error!Wasi {
             return .{
-                .args = allocArgs(allocator) catch |err| switch (err) {
-                    error.Unexpected => &.{},
+                .args = allocArgs(allocator, args_sizes_get, args_get) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.Unexpected => &.{},
                 },
                 .allocator = allocator,
             };
         }
 
-        fn allocArgs(allocator: Allocator) (Allocator.Error || os.UnexpectedError)![][*:0]u8 {
+        fn allocArgs(
+            allocator: Allocator,
+            comptime args_sizes_get: @TypeOf(os.wasi.args_sizes_get),
+            comptime args_get: @TypeOf(os.wasi.args_get),
+        ) (Allocator.Error || os.UnexpectedError)![][*:0]u8 {
             var args_len: usize = undefined;
             var buf_len: usize = undefined;
-            switch (os.wasi.args_sizes_get(&args_len, &buf_len)) {
+            switch (args_sizes_get(&args_len, &buf_len)) {
                 .SUCCESS => {},
                 else => |err| return os.unexpectedErrno(err),
             }
             if (args_len == 0) return &.{};
 
-            const args_bytes_len = @sizeOf([*:0]u8) * args_len;
-            const raw_len = args_bytes_len + buf_len;
+            const raw_len_bytelen = @sizeOf(usize);
+            const args_bytestart = mem.alignForward(usize, raw_len_bytelen, @alignOf([][*:0]u8));
+            const args_bytelen = @sizeOf([*:0]u8) * args_len;
+            const buf_start = args_bytestart + args_bytelen;
+            const raw_len_value = buf_start + buf_len;
 
-            const raw = try allocator.alignedAlloc(u8, @alignOf([:0]u8), raw_len);
+            const alignment = @max(@alignOf(usize), @alignOf([][*:0]u8));
+            const raw = try allocator.alignedAlloc(u8, alignment, raw_len_value);
             errdefer allocator.free(raw);
 
-            const args_bytes_start = 0;
-            const args = @as([*][*:0]u8, @ptrCast(@alignCast(raw.ptr + args_bytes_start)))[0..args_len];
-            const buf_start = args_bytes_len;
+            const raw_len: *usize = @ptrCast(raw.ptr);
+            const args = @as([*][*:0]u8, @ptrCast(@alignCast(raw.ptr + args_bytestart)))[0..args_len];
             const buf = raw[buf_start..];
             assert(buf.len == buf_len);
 
-            return switch (os.wasi.args_get(args.ptr, buf.ptr)) {
-                .SUCCESS => args,
-                else => |err| os.unexpectedErrno(err),
-            };
+            raw_len.* = raw_len_value;
+            switch (args_get(args.ptr, buf.ptr)) {
+                .SUCCESS => {},
+                else => |err| return os.unexpectedErrno(err),
+            }
+
+            return args;
         }
 
         pub fn next(it: *Wasi) ?[:0]const u8 {
@@ -488,15 +263,16 @@ pub const Iterator = struct {
             return true;
         }
 
+        pub fn reset(it: *Wasi) void {
+            it.index = 0;
+        }
+
         pub fn deinit(it: *Wasi) void {
-            const allocator = it.allocator orelse return;
-            if (it.args.len == 0) return;
-            var raw_len: usize = @sizeOf([*:0]u8) * it.args.len;
-            for (it.args) |arg| {
-                raw_len += mem.len(arg) + 1;
-            }
-            const raw = @as([*]align(@alignOf([*:0]u8)) const u8, @ptrCast(it.args.ptr))[0..raw_len];
-            allocator.free(raw);
+            const raw_len_addr = mem.alignBackward(usize, @intFromPtr(it.args.ptr) - 1, @alignOf(usize));
+            const raw_len: *usize = @ptrFromInt(raw_len_addr);
+            const alignment = @max(@alignOf(usize), @alignOf([][*:0]u8));
+            const raw = @as([*]align(alignment) const u8, @ptrCast(it.args.ptr))[0..raw_len.*];
+            it.allocator.free(raw);
         }
     };
 
@@ -509,15 +285,13 @@ pub const Iterator = struct {
         return struct {
             response_file: []const u8,
             index: usize = 0,
-            start_of_line: bool = true,
             buf: []u8,
             end: usize = 0,
             allocator: Allocator,
 
             pub fn init(allocator: Allocator, response_file: []const u8) Allocator.Error!ResponseFile(options) {
                 var index: usize = 0;
-                var start_of_line: bool = true;
-                const buf = try allocator.alloc(u8, getBufferLength(response_file, &index, &start_of_line));
+                const buf = try allocator.alloc(u8, countLengths(response_file, &index).buf);
 
                 return .{
                     .response_file = response_file,
@@ -527,194 +301,25 @@ pub const Iterator = struct {
             }
 
             pub fn next(it: *ResponseFile(options)) ?[:0]const u8 {
-                if (encodeNext(it.response_file, &it.index, &it.start_of_line, it.buf[it.end..])) |arg| {
-                    it.end += arg.len + 1;
-                    return arg;
-                } else {
-                    return null;
-                }
-            }
-
-            pub fn skip(it: *ResponseFile(options)) bool {
-                return skipNext(it.response_file, &it.index, &it.start_of_line);
-            }
-
-            pub fn deinit(it: *ResponseFile(options)) void {
-                it.allocator.free(it.buf);
-            }
-
-            fn parseResponseFile(context: anytype) @TypeOf(context.eof()) {
-                var c: u8 = undefined;
-
-                // Skip whitespace and comments.
-                // If comments are enabled, '#' starts a line comment if it is the first
-                // non-whitespace character on its line, otherwise, it is handled as any
-                // other character.
-                // The iterator completes if we reach the end of the string here.
-                while (true) {
-                    c = nextByte(context);
-                    switch (c) {
-                        0 => {
-                            return context.eof();
-                        },
-                        ' ', '\t' => {
-                            continue;
-                        },
-                        '\r', '\n' => {
-                            context.start_of_line.* = true;
-                            continue;
-                        },
-                        '#' => {
-                            if (options.comments and context.start_of_line.*) {
-                                while (true) {
-                                    c = nextByte(context);
-                                    switch (c) {
-                                        0 => return context.eof(),
-                                        '\n' => break,
-                                        else => continue,
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
-                        },
-                        else => {
-                            break;
-                        },
-                    }
-                }
-                context.start_of_line.* = false;
-
-                // Parsing rules:
-                //
-                // - The end of the string always terminates the current argument.
-                // - When not in 'inside_quotes' mode, a space or tab terminates the
-                //   current argument.
-                // - 2n backslashes followed by a quote emit n backslashes. If in 'inside_quotes'
-                //   and the quote is immediately followed by a second quote, one quote is emitted
-                //   and the other is skipped, otherwise, the one quote is skipped. Finally,
-                //   'inside_quotes' is toggled.
-                // - 2n + 1 backslashes followed by a quote emit n backslashes followed by a quote.
-                // - n backslashes not followed by a quote emit n backslashes.
-                // - The opening quote character must match the closing quote character.
-                //
-                var backslash_count: usize = 0;
-                var inside_quotes = false;
-                var quote_c: u8 = '"';
-                var after_unquote = false;
-                while (true) {
-                    switch (c) {
-                        0 => {
-                            context.emitBackslashes(backslash_count);
-                            return context.yield();
-                        },
-                        ' ', '\t', '\r', '\n' => {
-                            context.emitBackslashes(backslash_count);
-                            backslash_count = 0;
-                            after_unquote = false;
-                            if (inside_quotes) {
-                                context.emitByte(c);
-                            } else {
-                                if (c == '\r' or c == '\n') {
-                                    context.start_of_line.* = true;
-                                }
-                                return context.yield();
-                            }
-                        },
-                        '"', '\'' => {
-                            if (!options.single_quotes and c == '\'' or inside_quotes and c != quote_c) {
-                                context.emitBackslashes(backslash_count);
-                                backslash_count = 0;
-                                after_unquote = false;
-                                context.emitByte(c);
-                            } else {
-                                if (after_unquote) {
-                                    after_unquote = false;
-                                    context.emitByte(c);
-                                } else {
-                                    const c_is_escaped_quote = backslash_count % 2 != 0;
-                                    context.emitBackslashes(backslash_count / 2);
-                                    backslash_count = 0;
-                                    if (c_is_escaped_quote) {
-                                        context.emitByte(c);
-                                    } else {
-                                        if (inside_quotes) {
-                                            after_unquote = true;
-                                        } else {
-                                            quote_c = c;
-                                        }
-                                        inside_quotes = !inside_quotes;
-                                    }
-                                }
-                            }
-                        },
-                        '\\' => {
-                            backslash_count += 1;
-                            after_unquote = false;
-                        },
-                        else => {
-                            context.emitBackslashes(backslash_count);
-                            backslash_count = 0;
-                            after_unquote = false;
-                            context.emitByte(c);
-                        },
-                    }
-                    c = nextByte(context);
-                }
-            }
-
-            fn nextByte(context: anytype) u8 {
-                if (context.index.* != context.response_file.len) {
-                    const c = context.response_file[context.index.*];
-                    context.index.* += 1;
-                    return c;
-                } else {
-                    return 0;
-                }
-            }
-
-            fn getBufferLength(response_file: []const u8, index: *usize, start_of_line: *bool) usize {
-                const Counter = struct {
-                    response_file: []const u8,
-                    index: *usize,
-                    start_of_line: *bool,
-                    buf: usize = 0,
-                    fn emitByte(counter: *@This(), _: u8) void {
-                        counter.buf += 1;
-                    }
-                    fn emitBackslashes(counter: *@This(), n: usize) void {
-                        counter.buf += n;
-                    }
-                    fn yield(counter: *@This()) bool {
-                        counter.buf += 1;
-                        return true;
-                    }
-                    fn eof(_: *@This()) bool {
-                        return false;
-                    }
-                };
-                var counter: Counter = .{
-                    .response_file = response_file,
-                    .index = index,
-                    .start_of_line = start_of_line,
-                };
-                while (parseResponseFile(&counter)) {}
-                return counter.buf;
-            }
-
-            /// Assumes `buf` is large enough to hold the next argument.
-            fn encodeNext(response_file: []const u8, index: *usize, start_of_line: *bool, buf: []u8) ?[:0]u8 {
                 const Encoder = struct {
                     response_file: []const u8,
                     index: *usize,
-                    start_of_line: *bool,
                     buf: []u8,
                     end: usize = 0,
-                    fn emitByte(encoder: *@This(), c: u8) void {
+                    fn readNextCharacter(encoder: *@This()) u8 {
+                        if (encoder.index.* != encoder.response_file.len) {
+                            const c = encoder.response_file[encoder.index.*];
+                            encoder.index.* += 1;
+                            return c;
+                        } else {
+                            return 0;
+                        }
+                    }
+                    fn writeCharacter(encoder: *@This(), c: u8) void {
                         encoder.buf[encoder.end] = c;
                         encoder.end += 1;
                     }
-                    fn emitBackslashes(encoder: *@This(), n: usize) void {
+                    fn writeBackslashes(encoder: *@This(), n: usize) void {
                         @memset(encoder.buf[encoder.end..][0..n], '\\');
                         encoder.end += n;
                     }
@@ -727,22 +332,33 @@ pub const Iterator = struct {
                     }
                 };
                 var encoder: Encoder = .{
-                    .response_file = response_file,
-                    .index = index,
-                    .start_of_line = start_of_line,
-                    .buf = buf,
+                    .response_file = it.response_file,
+                    .index = &it.index,
+                    .buf = it.buf[it.end..],
                 };
-                const arg = parseResponseFile(&encoder);
-                return arg;
+                if (parseCommandLineString(&encoder, .{ .response_file = options }, it.index == 0)) |arg| {
+                    it.end += arg.len + 1;
+                    return arg;
+                } else {
+                    return null;
+                }
             }
 
-            fn skipNext(response_file: []const u8, index: *usize, start_of_line: *bool) bool {
+            pub fn skip(it: *ResponseFile(options)) bool {
                 const Skipper = struct {
                     response_file: []const u8,
                     index: *usize,
-                    start_of_line: *bool,
-                    fn emitByte(_: *@This(), _: u8) void {}
-                    fn emitBackslashes(_: *@This(), _: usize) void {}
+                    fn readNextCharacter(skipper: *@This()) u8 {
+                        if (skipper.index.* != skipper.response_file.len) {
+                            const c = skipper.response_file[skipper.index.*];
+                            skipper.index.* += 1;
+                            return c;
+                        } else {
+                            return 0;
+                        }
+                    }
+                    fn writeCharacter(_: *@This(), _: u21) void {}
+                    fn writeBackslashes(_: *@This(), _: usize) void {}
                     fn yield(_: *@This()) bool {
                         return true;
                     }
@@ -751,13 +367,250 @@ pub const Iterator = struct {
                     }
                 };
                 var skipper: Skipper = .{
+                    .response_file = it.response_file,
+                    .index = &it.index,
+                };
+                return parseCommandLineString(&skipper, .{ .response_file = options }, it.index == 0);
+            }
+
+            pub fn reset(it: *ResponseFile(options)) void {
+                it.index = 0;
+                it.end = 0;
+            }
+
+            pub fn deinit(it: *ResponseFile(options)) void {
+                it.allocator.free(it.buf);
+            }
+
+            fn countLengths(response_file: []const u8, index: *usize) struct { args: usize, buf: usize } {
+                const Counter = struct {
+                    response_file: []const u8,
+                    index: *usize,
+                    args: usize = 0,
+                    buf: usize = 0,
+                    fn readNextCharacter(counter: *@This()) u8 {
+                        if (counter.index.* != counter.response_file.len) {
+                            const c = counter.response_file[counter.index.*];
+                            counter.index.* += 1;
+                            return c;
+                        } else {
+                            return 0;
+                        }
+                    }
+                    fn writeCharacter(counter: *@This(), _: u8) void {
+                        counter.buf += 1;
+                    }
+                    fn writeBackslashes(counter: *@This(), n: usize) void {
+                        counter.buf += n;
+                    }
+                    fn yield(counter: *@This()) bool {
+                        counter.buf += 1;
+                        counter.args += 1;
+                        return true;
+                    }
+                    fn eof(_: *@This()) bool {
+                        return false;
+                    }
+                };
+                var counter: Counter = .{
                     .response_file = response_file,
                     .index = index,
-                    .start_of_line = start_of_line,
                 };
-                const eof = parseResponseFile(&skipper);
-                return eof;
+                while (parseCommandLineString(&counter, .{ .response_file = options }, index.* == 0)) {}
+                return .{ .args = counter.args, .buf = counter.buf };
             }
+        };
+    }
+
+    /// Common command-line string parsing logic shared by `Windows` and `ResponseFile`.
+    ///
+    /// For `Windows`, this function faithfully replicates the parsing behavior observed in
+    /// `CommandLineToArgvW` with one exception: if the command-line string is empty, the iterator
+    /// will immediately complete without returning any arguments (whereas `CommandLineArgvW` will
+    /// return a single argument representing the name of the current executable).
+    ///
+    /// The essential parts of the algorithm are described in Microsoft's documentation:
+    ///
+    /// - <https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args?view=msvc-170#parsing-c-command-line-arguments>
+    /// - <https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw>
+    ///
+    /// David Deley explains some additional undocumented quirks in great detail:
+    ///
+    /// - <https://daviddeley.com/autohotkey/parameters/parameters.htm#WINCRULES>
+    ///
+    /// Non-DEL ASCII control characters terminating an unquoted first argument was discovered
+    /// independently by testing and observing the behavior of `CommandLineToArgvW` on Windows 10.
+    ///
+    /// For `ResponseFile`, a simplified variation of the same base algorithm that also handles
+    /// newlines and (optionally) comments and single quotes is used.
+    ///
+    fn parseCommandLineString(
+        context: anytype,
+        comptime mode: union(enum) {
+            windows,
+            response_file: ResponseFileOptions,
+        },
+        is_arg0: bool,
+    ) @TypeOf(context.eof()) {
+        const handle_newlines = mode != .windows;
+        const handle_comments = switch (mode) {
+            .windows => false,
+            .response_file => |rsp| rsp.comments,
+        };
+        const handle_single_quotes = switch (mode) {
+            .windows => false,
+            .response_file => |rsp| rsp.single_quotes,
+        };
+        const arg0_quirks = mode == .windows;
+        const unquote_quirks = mode == .windows;
+
+        var c = context.readNextCharacter();
+
+        if (arg0_quirks and is_arg0) {
+            // The first argument (the executable name) uses different parsing rules.
+            switch (c) {
+                0 => {
+                    // Immediately complete the iterator without yielding any arguments.
+                    // 'CommandLineToArgvW' would return the name of the current executable here.
+                    return context.eof();
+                },
+                '"' => {
+                    // If the first character is a quote, read everything until the next quote
+                    // (then skip that quote), or until the end of the string.
+                    while (true) {
+                        c = context.readNextCharacter();
+                        switch (c) {
+                            '"', 0 => return context.yield(),
+                            else => context.writeCharacter(c),
+                        }
+                    }
+                },
+                else => {
+                    // Otherwise, read everything until the next space or non-DEL ASCII control
+                    // character (then skip that character), or until the end of the string.
+                    // This means that if the command-line string starts with one of these
+                    // characters, the first yielded argument will be the empty string.
+                    while (true) : (c = context.readNextCharacter()) {
+                        switch (c) {
+                            0...' ' => return context.yield(),
+                            else => context.writeCharacter(c),
+                        }
+                    }
+                },
+            }
+        }
+
+        // Skip whitespace and comments.
+        // The iterator completes if we reach the end of the string here.
+        while (true) : (c = context.readNextCharacter()) switch (c) {
+            0 => {
+                return context.eof();
+            },
+            ' ', '\t', '\r', '\n' => {
+                if (!handle_newlines and (c == '\r' or c == '\n')) {
+                    break;
+                }
+            },
+            '#' => {
+                if (!handle_comments) {
+                    break;
+                }
+                while (true) {
+                    c = context.readNextCharacter();
+                    switch (c) {
+                        0 => return context.eof(),
+                        '\r', '\n' => break,
+                        else => {},
+                    }
+                }
+            },
+            else => {
+                break;
+            },
+        };
+
+        // Parsing rules:
+        //
+        // - The end of the string always terminates the current argument.
+        // - When not in 'inside_quotes' mode, whitespace terminates the current argument.
+        // - 2n backslashes followed by an opening quote or matching closing quote produce
+        //   n backslashes and toggle 'inside_quotes'.
+        // - 2n + 1 backslashes followed by an opening quote or matching closing quote produce
+        //   n backslashes followed by that quote.
+        // - n backslashes not followed by a quote produce n backslashes.
+        // - If 'unquote_quirks' is in effect, an quote immediately following a closing quote is
+        //   interpreted literally.
+        //
+        var backslashes: usize = 0;
+        var inside_quotes = false;
+        var quote_c: if (handle_single_quotes) @TypeOf(c) else void = if (handle_single_quotes) 0 else {};
+        var after_unquote: if (unquote_quirks) bool else void = if (unquote_quirks) false else {};
+        while (true) : (c = context.readNextCharacter()) switch (c) {
+            0 => {
+                context.writeBackslashes(backslashes);
+                return context.yield();
+            },
+            ' ', '\t', '\r', '\n' => {
+                context.writeBackslashes(backslashes);
+                backslashes = 0;
+                if (unquote_quirks) {
+                    after_unquote = false;
+                }
+                if (!handle_newlines and (c == '\r' or c == '\n')) {
+                    context.writeCharacter(c);
+                } else {
+                    if (inside_quotes) {
+                        context.writeCharacter(c);
+                    } else {
+                        return context.yield();
+                    }
+                }
+            },
+            '"', '\'' => {
+                if (!handle_single_quotes and c == '\'' or
+                    inside_quotes and handle_single_quotes and c != quote_c or
+                    unquote_quirks and after_unquote and (!handle_single_quotes or c == quote_c))
+                {
+                    context.writeBackslashes(backslashes);
+                    backslashes = 0;
+                    if (unquote_quirks) {
+                        after_unquote = false;
+                    }
+                    context.writeCharacter(c);
+                } else {
+                    const c_is_escaped_quote = backslashes % 2 != 0;
+                    context.writeBackslashes(backslashes / 2);
+                    backslashes = 0;
+                    if (c_is_escaped_quote) {
+                        context.writeCharacter(c);
+                    } else {
+                        if (inside_quotes) {
+                            if (unquote_quirks) {
+                                after_unquote = true;
+                            }
+                        } else {
+                            if (handle_single_quotes) {
+                                quote_c = c;
+                            }
+                        }
+                        inside_quotes = !inside_quotes;
+                    }
+                }
+            },
+            '\\' => {
+                backslashes += 1;
+                if (unquote_quirks) {
+                    after_unquote = false;
+                }
+            },
+            else => {
+                context.writeBackslashes(backslashes);
+                backslashes = 0;
+                if (unquote_quirks) {
+                    after_unquote = false;
+                }
+                context.writeCharacter(c);
+            },
         };
     }
 };

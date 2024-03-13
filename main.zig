@@ -17,26 +17,27 @@ pub fn main() !void {
         std.debug.print("{}\n", .{std.unicode.fmtUtf16Le(std.mem.span(std.os.windows.kernel32.GetCommandLineW()))});
     }
 
-    std.debug.print("process.args.alloc\n", .{});
-    {
-        const args = try process.args.alloc(gpa);
-        defer process.args.free(gpa, args);
+    //std.debug.print("process.args.alloc\n", .{});
+    //{
+    //    const args = try process.args.alloc(gpa);
+    //    defer process.args.free(gpa, args);
 
-        for (args[@min(args.len, 1)..], 1..) |arg, i| {
-            std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
-        }
-    }
+    //    for (args[@min(args.len, 1)..], 1..) |arg, i| {
+    //        std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+    //    }
+    //}
 
     std.debug.print("process.args.iterator\n", .{});
     {
         var args = try process.args.iterator(gpa);
         defer args.deinit();
 
-        _ = args.skip();
-        var i: usize = 1;
-        while (args.next()) |arg| {
+        while (args.skip()) {}
+        args.reset();
+
+        var i: usize = 0;
+        while (args.next()) |arg| : (i += 1) {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
-            i += 1;
         }
     }
 
@@ -45,17 +46,26 @@ pub fn main() !void {
         const rsp =
             \\hello world #yolo
             \\# this is a comment
-            \\    # this is also a comment
-            \\"" # but this is not a comment
-            \\"a b c" a\"b\"c
+            \\  # this is also a comment
+            \\abc # this is now also a comment
+            \\"new
+            \\line"
+            \\'new
+            \\line'
+            \\"a b\" c\\" 'a b\' c\\'
         ;
-        var args = try process.args.Iterator.ResponseFile(.{ .comments = true }).init(gpa, rsp);
+        var args = try process.args.Iterator.ResponseFile(.{
+            .comments = true,
+            .single_quotes = true,
+        }).init(gpa, rsp);
         defer args.deinit();
 
+        while (args.skip()) {}
+        args.reset();
+
         var i: usize = 0;
-        while (args.next()) |arg| {
+        while (args.next()) |arg| : (i += 1) {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
-            i += 1;
         }
     }
 }

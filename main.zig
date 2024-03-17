@@ -13,13 +13,9 @@ pub fn main() !void {
 
     const gpa = gpa_state.allocator();
 
-    if (builtin.os.tag == .windows) {
-        std.debug.print("{}\n", .{std.unicode.fmtUtf16Le(std.mem.span(std.os.windows.kernel32.GetCommandLineW()))});
-    }
-
     std.debug.print("process.args.alloc\n", .{});
     {
-        const args = try process.args.slice(gpa);
+        const args = try process.args.allocSlice(gpa);
         defer process.args.freeSlice(gpa, args);
 
         for (args, 0..) |arg, i| {
@@ -29,7 +25,7 @@ pub fn main() !void {
 
     std.debug.print("process.args.iterator\n", .{});
     {
-        var args = try process.args.iterator(gpa);
+        var args = try process.args.iterator(gpa, .{ .stable = false });
         defer args.deinit();
 
         while (args.skip()) {}
@@ -41,23 +37,37 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("process.args.Iterator.ResponseFile\n", .{});
+    const rsp =
+        \\hello world #yolo
+        \\# this is a comment
+        \\  # this is also a comment
+        \\abc # this is now also a comment
+        \\"new
+        \\line"
+        \\'new
+        \\line'
+        \\"a b\" c\\" 'a b\' c\\'
+    ;
+
+    std.debug.print("process.args.allocSliceResponseFile\n", .{});
     {
-        const rsp =
-            \\hello world #yolo
-            \\# this is a comment
-            \\  # this is also a comment
-            \\abc # this is now also a comment
-            \\"new
-            \\line"
-            \\'new
-            \\line'
-            \\"a b\" c\\" 'a b\' c\\'
-        ;
-        var args = try process.args.Iterator.ResponseFile(.{
+        const args = try process.args.allocSliceResponseFile(.{
             .comments = true,
             .single_quotes = true,
-        }).init(gpa, rsp);
+        }, gpa, rsp);
+        defer process.args.freeSlice(gpa, args);
+
+        for (args, 0..) |arg, i| {
+            std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
+        }
+    }
+
+    std.debug.print("process.args.Iterator.ResponseFile\n", .{});
+    {
+        var args = try process.args.IteratorResponseFile(.{
+            .comments = true,
+            .single_quotes = true,
+        }).init(gpa, rsp, .{ .stable = false });
         defer args.deinit();
 
         while (args.skip()) {}

@@ -46,17 +46,16 @@ pub fn allocSlicePosix(
 
 pub fn allocSliceWindows(
     allocator: Allocator,
-    command_line_w: [*:0]const u16,
+    cmd_line_w: [*:0]const u16,
 ) Allocator.Error![][:0]u8 {
-    const command_line_w_slice = mem.span(command_line_w);
-    var command_line_it = unicode.Wtf16LeIterator.init(command_line_w_slice);
-    const lengths = IteratorWindows.countLengths(&command_line_it);
+    var cmd_line_it = unicode.Wtf16LeIterator.init(mem.span(cmd_line_w));
+    const lengths = IteratorWindows.countLengths(&cmd_line_it);
     const raw = try allocSliceRaw(allocator, lengths.args, lengths.buf_total);
 
-    command_line_it.i = 0;
+    cmd_line_it.i = 0;
     var index: usize = 0;
     var end: usize = 0;
-    while (IteratorWindows.encodeNext(&command_line_it, raw.buf[end..])) |arg| {
+    while (IteratorWindows.encodeNext(&cmd_line_it, raw.buf[end..])) |arg| {
         raw.args[index] = arg;
         end += arg.len + 1;
         index += 1;
@@ -78,6 +77,7 @@ pub fn allocSliceWasi(
         else => |err| return os.unexpectedErrno(err),
     }
     const raw = try allocSliceRaw(allocator, args_len, buf_len);
+    errdefer freeSlice(allocator, raw.args);
 
     switch (args_get(raw.temp.ptr, raw.buf.ptr)) {
         .SUCCESS => {},
@@ -129,7 +129,6 @@ fn allocSliceRaw(
 
     const alignment = @max(@alignOf(usize), @alignOf([:0]u8), @alignOf([*:0]u8));
     const raw = try allocator.alignedAlloc(u8, alignment, raw_len_value);
-    errdefer allocator.free(raw);
 
     const raw_len: *usize = @ptrCast(raw.ptr);
     raw_len.* = raw_len_value;
@@ -204,7 +203,7 @@ pub const IteratorPosix = struct {
 };
 
 pub const IteratorWindows = struct {
-    command_line: unicode.Wtf16LeIterator,
+    cmd_line: unicode.Wtf16LeIterator,
     buf: []u8,
     buf_i: usize = 0,
     allocator: Allocator,
@@ -214,17 +213,17 @@ pub const IteratorWindows = struct {
 
     pub fn init(
         allocator: Allocator,
-        command_line_w: [*:0]const u16,
+        cmd_line_w: [*:0]const u16,
         options: IteratorOptions,
     ) InitError!IteratorWindows {
-        const command_line_w_slice = mem.span(command_line_w);
-        var command_line_it = unicode.Wtf16LeIterator.init(command_line_w_slice);
-        const lengths = countLengths(&command_line_it);
+        var cmd_line_it = unicode.Wtf16LeIterator.init(mem.span(cmd_line_w));
+        const lengths = countLengths(&cmd_line_it);
         const buf_len = if (options.stable) lengths.buf_total else lengths.buf_max;
         const buf = try allocator.alloc(u8, buf_len);
 
+        cmd_line_it.i = 0;
         return .{
-            .command_line = unicode.Wtf16LeIterator.init(command_line_w_slice),
+            .cmd_line = cmd_line_it,
             .buf = buf,
             .allocator = allocator,
             .stable = options.stable,
@@ -232,7 +231,7 @@ pub const IteratorWindows = struct {
     }
 
     pub fn next(it: *IteratorWindows) ?[:0]const u8 {
-        if (encodeNext(&it.command_line, it.buf[it.buf_i..])) |arg| {
+        if (encodeNext(&it.cmd_line, it.buf[it.buf_i..])) |arg| {
             if (it.stable) {
                 it.buf_i += arg.len + 1;
             }
@@ -246,11 +245,11 @@ pub const IteratorWindows = struct {
         return if (it.stable)
             it.next() != null
         else
-            skipNext(&it.command_line);
+            skipNext(&it.cmd_line);
     }
 
     pub fn reset(it: *IteratorWindows) void {
-        it.command_line.i = 0;
+        it.cmd_line.i = 0;
         it.buf_i = 0;
     }
 
@@ -258,19 +257,19 @@ pub const IteratorWindows = struct {
         it.allocator.free(it.buf);
     }
 
-    fn countLengths(command_line: *unicode.Wtf16LeIterator) struct {
+    fn countLengths(cmd_line: *unicode.Wtf16LeIterator) struct {
         args: usize,
         buf_total: usize,
         buf_max: usize,
     } {
         const Counter = struct {
-            command_line: *unicode.Wtf16LeIterator,
+            cmd_line: *unicode.Wtf16LeIterator,
             args: usize = 0,
             buf_current: usize = 0,
             buf_total: usize = 0,
             buf_max: usize = 0,
             fn readNextCharacter(counter: *@This()) u21 {
-                return counter.command_line.nextCodepoint() orelse 0;
+                return counter.cmd_line.nextCodepoint() orelse 0;
             }
             fn writeCharacter(counter: *@This(), c: u21) void {
                 counter.buf_current += unicode.utf8CodepointSequenceLength(c) catch unreachable;
@@ -290,8 +289,8 @@ pub const IteratorWindows = struct {
                 return false;
             }
         };
-        var counter: Counter = .{ .command_line = command_line };
-        while (parseCommandLineString(&counter, .windows, command_line.i == 0)) {}
+        var counter: Counter = .{ .cmd_line = cmd_line };
+        while (parseCommandLineString(&counter, .windows, cmd_line.i == 0)) {}
         return .{
             .args = counter.args,
             .buf_total = counter.buf_total,
@@ -299,13 +298,13 @@ pub const IteratorWindows = struct {
         };
     }
 
-    fn encodeNext(command_line: *unicode.Wtf16LeIterator, buf: []u8) ?[:0]u8 {
+    fn encodeNext(cmd_line: *unicode.Wtf16LeIterator, buf: []u8) ?[:0]u8 {
         const Encoder = struct {
-            command_line: *unicode.Wtf16LeIterator,
+            cmd_line: *unicode.Wtf16LeIterator,
             buf: []u8,
             end: usize = 0,
             fn readNextCharacter(encoder: *@This()) u21 {
-                return encoder.command_line.nextCodepoint() orelse 0;
+                return encoder.cmd_line.nextCodepoint() orelse 0;
             }
             fn writeCharacter(encoder: *@This(), c: u21) void {
                 encoder.end += unicode.wtf8Encode(c, encoder.buf[encoder.end..]) catch unreachable;
@@ -322,15 +321,15 @@ pub const IteratorWindows = struct {
                 return null;
             }
         };
-        var encoder: Encoder = .{ .command_line = command_line, .buf = buf };
-        return parseCommandLineString(&encoder, .windows, command_line.i == 0);
+        var encoder: Encoder = .{ .cmd_line = cmd_line, .buf = buf };
+        return parseCommandLineString(&encoder, .windows, cmd_line.i == 0);
     }
 
-    fn skipNext(command_line: *unicode.Wtf16LeIterator) bool {
+    fn skipNext(cmd_line: *unicode.Wtf16LeIterator) bool {
         const Skipper = struct {
-            command_line: *unicode.Wtf16LeIterator,
+            cmd_line: *unicode.Wtf16LeIterator,
             fn readNextCharacter(skipper: *@This()) u21 {
-                return skipper.command_line.nextCodepoint() orelse 0;
+                return skipper.cmd_line.nextCodepoint() orelse 0;
             }
             fn writeCharacter(_: *@This(), _: u21) void {}
             fn writeBackslashes(_: *@This(), _: usize) void {}
@@ -341,8 +340,8 @@ pub const IteratorWindows = struct {
                 return false;
             }
         };
-        var skipper: Skipper = .{ .command_line = command_line };
-        return parseCommandLineString(&skipper, .windows, command_line.i == 0);
+        var skipper: Skipper = .{ .cmd_line = cmd_line };
+        return parseCommandLineString(&skipper, .windows, cmd_line.i == 0);
     }
 };
 
@@ -365,7 +364,6 @@ pub const IteratorWasi = struct {
                 .SUCCESS => {},
                 else => |err| return os.unexpectedErrno(err),
             }
-            if (args_len == 0) break :alloc_args &.{};
 
             const raw_len_bytelen = @sizeOf(usize);
             const args_bytelen = @sizeOf([*:0]u8) * args_len;
@@ -779,25 +777,154 @@ fn parseCommandLineString(
     };
 }
 
-pub const SerializeOptions = struct {
-    sentinel: ?u0 = 0,
-    allow_embedded_sentinels: bool = false,
+pub fn toCommandLineW(allocator: Allocator, args: Iterator) ![:0]u16 {
+    _ = allocator;
+    _ = args;
+}
+
+pub fn toResponseFile(allocator: Allocator, args: anytype) ![]u8 {
+    const it_initial = asIterator(args);
+
+    var it = it_initial;
+    var arg0 = true;
+    var serialized_end: usize = 0;
+    while (it.next()) |arg| {
+        if (!arg0) {
+            serialized_end += 1; // Space.
+        } else {
+            arg0 = false;
+        }
+        var must_quote = arg.len == 0;
+        var contains_quotes_or_backslashes = false;
+        for (arg) |c| {
+            if (c <= ' ' or c == '\'' or c == '#') {
+                must_quote = true;
+                continue;
+            }
+            if (c == '"' or c == '\\') {
+                must_quote = true;
+                contains_quotes_or_backslashes = true;
+                break;
+            }
+        }
+        if (must_quote) {
+            serialized_end += 2; // Opening and closing quotes.
+        }
+        if (!contains_quotes_or_backslashes) {
+            serialized_end += arg.len;
+        } else {
+            // Slow path.
+            var backslashes: usize = 0;
+            for (arg) |c| switch (c) {
+                '\\' => {
+                    backslashes += 1;
+                },
+                '"' => {
+                    serialized_end += 2 * backslashes + 2; // Escaped backslashes + escaped quote.
+                    backslashes = 0;
+                },
+                else => {
+                    serialized_end += backslashes + 1; // Unescaped backslashes + current char.
+                    backslashes = 0;
+                },
+            };
+            serialized_end += 2 * backslashes; // Escaped backslashes.
+        }
+    }
+    const serialized = try allocator.alloc(u8, serialized_end);
+
+    it = it_initial;
+    arg0 = true;
+    serialized_end = 0;
+    while (it.next()) |arg| {
+        if (!arg0) {
+            serialized[serialized_end] = ' ';
+            serialized_end += 1;
+        } else {
+            arg0 = false;
+        }
+        var must_quote = arg.len == 0;
+        var contains_quotes_or_backslashes = false;
+        for (arg) |c| {
+            if (c <= ' ' or c == '\'' or c == '#') {
+                must_quote = true;
+                continue;
+            }
+            if (c == '"' or c == '\\') {
+                must_quote = true;
+                contains_quotes_or_backslashes = true;
+                break;
+            }
+        }
+        if (must_quote) {
+            serialized[serialized_end] = '"';
+            serialized_end += 1;
+        }
+        if (!contains_quotes_or_backslashes) {
+            @memcpy(serialized[serialized_end..][0..arg.len], arg);
+            serialized_end += arg.len;
+        } else {
+            // Slow path.
+            var backslashes: usize = 0;
+            for (arg) |c| switch (c) {
+                '\\' => {
+                    backslashes += 1;
+                },
+                '"' => {
+                    @memset(serialized[serialized_end..][0..(2 * backslashes + 1)], '\\');
+                    serialized[serialized_end + 2 * backslashes + 1] = '"';
+                    serialized_end += 2 * backslashes + 1 + 1;
+                    backslashes = 0;
+                },
+                else => {
+                    @memset(serialized[serialized_end..][0..backslashes], '\\');
+                    serialized[serialized_end + backslashes] = c;
+                    serialized_end += backslashes + 1;
+                    backslashes = 0;
+                },
+            };
+            @memset(serialized[serialized_end..][0..(2 * backslashes)], '\\');
+            serialized_end += 2 * backslashes;
+        }
+        if (must_quote) {
+            serialized[serialized_end] = '"';
+            serialized_end += 1;
+        }
+    }
+    assert(serialized_end == serialized.len);
+    return serialized;
+}
+
+fn asIterator(args: anytype) as_it: {
+    switch (@typeInfo(@TypeOf(args))) {
+        .Pointer => |ptr| switch (ptr.size) {
+            .Slice => break :as_it SliceIterator,
+            else => {},
+        },
+        .Struct => break :as_it @TypeOf(args),
+        else => {},
+    }
+    @compileError("expected slice or iterator, found '" ++ @typeName(@TypeOf(args)) ++ "'");
+} {
+    switch (@typeInfo(@TypeOf(args))) {
+        .Pointer => |ptr| switch (ptr.size) {
+            .Slice => return .{ .args = args },
+            else => {},
+        },
+        .Struct => return args,
+        else => {},
+    }
+    comptime unreachable;
+}
+
+const SliceIterator = struct {
+    args: []const [:0]const u8,
+    index: usize = 0,
+
+    fn next(it: *SliceIterator) ?[:0]const u8 {
+        if (it.index == it.args.len) return null;
+        const arg = it.args[it.index];
+        it.index += 1;
+        return arg;
+    }
 };
-
-pub fn serializeWindows(
-    allocator: Allocator,
-    args: anytype,
-    comptime options: SerializeOptions,
-) Allocator.Error!(if (options.sentinel) |z| [:z]u16 else []u16) {
-    _ = allocator;
-    _ = args;
-}
-
-pub fn serializeResponseFile(
-    allocator: Allocator,
-    args: anytype,
-    comptime options: SerializeOptions,
-) Allocator.Error!(if (options.sentinel) |z| [:z]u8 else []u8) {
-    _ = allocator;
-    _ = args;
-}

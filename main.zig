@@ -60,6 +60,11 @@ pub fn main() !void {
         for (args, 0..) |arg, i| {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
         }
+
+        const serialized = try process.args.toResponseFile(gpa, args);
+        defer gpa.free(serialized);
+
+        std.debug.print("\"{}\"\n", .{std.zig.fmtEscapes(serialized)});
     }
 
     std.debug.print("process.args.Iterator.ResponseFile\n", .{});
@@ -77,5 +82,12 @@ pub fn main() !void {
         while (args.next()) |arg| : (i += 1) {
             std.debug.print("args[{}]: \"{}\"\n", .{ i, std.zig.fmtEscapes(arg) });
         }
+
+        args.reset();
+
+        const serialized = try process.args.toResponseFile(gpa, args);
+        defer gpa.free(serialized);
+
+        std.debug.print("\"{}\"\n", .{std.zig.fmtEscapes(serialized)});
     }
 }
